@@ -34,7 +34,7 @@ Rerunning the script is safe.
 
 ## 2. Create the notebook
 
-1. Download [`l7a_data-read.ipynb`](l7a_data-read.ipynb) to your laptop: open it here and use the download button (**Download raw file**). The Glue console uploads it from your laptop in the next step.
+1. Download [`l7a_data-read.ipynb`](l7a_data-read.ipynb) (part B: [`l7b_slow-queries.ipynb`](l7b_slow-queries.ipynb)) to your laptop: open it here and use the download button (**Download raw file**). The Glue console uploads it from your laptop in the next step.
 2. In the AWS console, open **AWS Glue**, then **ETL jobs** > **Notebooks** in the menu on the left.
 3. Create a notebook, choose to upload your own notebook file, and pick `l7a_data-read.ipynb`.
 4. For the IAM role, choose **436c-glue-notebook**. Create the notebook.
@@ -46,7 +46,7 @@ cookies; allow them for the AWS console and reload.
 
 Run the cells in order. 
 
-The first code cells set the session's size (3 workers: one with Spark driver and two with Spark executors with 4 cores each). It also loads `sparkmeter`, a vibecoded helper for measuring Spark queries. 
+The first code cells set the session's size (3 workers: one with Spark driver and two with Spark executors with 4 slots each (4 vCPUs per worker)). It also loads `sparkmeter`, a vibecoded helper for measuring Spark queries. 
 
 The session starts (and you start paying money!) when the first Spark cell runs, which takes about 30 to 60 seconds.
 
@@ -76,6 +76,7 @@ uses.
 | File | What it is |
 |---|---|
 | [`l7a_data-read.ipynb`](l7a_data-read.ipynb) | Part A of the lecture demos: how Spark reads a folder of Parquet files, then exercises to try on your own |
+| [`l7b_slow-queries.ipynb`](l7b_slow-queries.ipynb) | Part B (the tutorial): three slow queries from L6 and their fixes, then exercises B1 to B5 with their answers in commented-out cells |
 | [`sparkmeter.py`](sparkmeter.py) | The measuring helper. The notebook loads its copy from `s3://436c-2026w1/l7/student/`. |
 | [`setup_glue.sh`](setup_glue.sh) | The setup script from step 1 |
 
@@ -88,12 +89,12 @@ The notebook runs each query as plain Spark, then asks `sparkmeter` (`sm`) what 
 | `sm.setup(spark, save_to=None)` | Connects to the session; with `save_to`, every recorded run is saved there |
 | `sm.capture(name)` or `sm.capture(name, df)` | Records the query that ran last (its jobs, stages, tasks and plan) under `name`. Run it right after the query. |
 | `sm.checklist(name)` | How that query read its files: folders kept, scan tasks, reading tasks, rows read |
-| `sm.stage_table(name)` | Per stage: tasks, tasks with rows, rows in and out of an `Exchange`, task times |
+| `sm.stage_table(name)` | Per stage: tasks, tasks with rows, rows in and out of an `Exchange`, largest task's rows, median rows of the tasks with rows, task times |
 | `sm.allocation(name)` | Tasks, rows and busy seconds per executor |
 | `sm.compare(name, query_function, settings)` | Runs a query (a function that returns a DataFrame) once under each set of Spark settings, building it fresh each time, and records every run |
 | `sm.tree(path)` | The folders and files under an S3 path; `row_groups=True` adds each file's row groups |
 | `sm.footer(path)` | What one Parquet file's footer holds: per row group and column, the min, max, nulls and size; `column=` and `between=` ask which row groups could match a condition |
-| `sm.report()` | Every saved run, side by side, one column per core count |
+| `sm.report()` | Every saved run, side by side, one column per slot count |
 
 `settings` in `sm.compare` is a dictionary from a label to Spark settings, for example
 `{"broadcast on": {"spark.sql.autoBroadcastJoinThreshold": "10m"}, "broadcast off": {"spark.sql.autoBroadcastJoinThreshold": "-1"}}`.

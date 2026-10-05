@@ -1,5 +1,5 @@
 """sparkmeter: see what a Spark query did, in a Glue notebook (or any PySpark session): its stages, tasks, plan and
-files read; compare settings and core counts.
+files read; compare settings and slot counts (a slot is one executor core: it runs one task at a time).
 
 In a Glue notebook, before the session starts:
     %%configure
@@ -8,7 +8,7 @@ In a Glue notebook, before the session starts:
 
 Then:
     import sparkmeter as sm
-    sm.setup(spark, save_to="s3://YOUR-BUCKET/sparkmeter/")      # checks the session, counts the cores
+    sm.setup(spark, save_to="s3://YOUR-BUCKET/sparkmeter/")      # checks the session, counts the slots
 
     june.collect()                          # your query, in a plain Spark cell
     sm.capture("june", june)                # in the next cell: record what that query did
@@ -20,7 +20,7 @@ Then:
                                               "1000": {"spark.sql.shuffle.partitions": "1000"}})
     with sm.track("write"): df.write.parquet(...)                 # a cell with several queries, as one run
     sm.tree("s3://.../folders/"); sm.footer("s3://.../part-0.parquet")   # what is stored, before reading it
-    sm.report()                                                  # every saved run, one column per core count
+    sm.report()                                                  # every saved run, one column per slot count
 
 How it works: the driver keeps a status store of every query, job, stage and task (the Spark UI is built on it;
 Glue notebook sessions run with the UI off, so this reads the store directly through py4j). Everything recorded is
@@ -34,16 +34,17 @@ CONFIGS = {  # name -> Spark SQL settings applied for the measurement, then put 
     "emr-1000": {"spark.sql.shuffle.partitions": "200", "spark.sql.adaptive.coalescePartitions.initialPartitionNum": "1000"},
     "adaptive-off": {"spark.sql.adaptive.enabled": "false"},
     "broadcast-off": {"spark.sql.autoBroadcastJoinThreshold": "-1"},
-    "split-32mb": {"spark.sql.files.maxPartitionBytes": "32m"},
+    "split-32mib": {"spark.sql.files.maxPartitionBytes": "32m"},
 }
 _S = {"warm": set(), "spark": None, "store": None, "jvm": None, "gateway": None, "save_to": None, "cores": None, "executors": None, "session": None, "runs": []}
 ROLE_COLOUR = {"scan stage": "#002145", "stage after an Exchange": "#9a4a17", "another input": "#6f9bd1",
-               "final totals": "#e0b27a", "schema job (reads footers)": "#7D8998"}   # same colours as the L6 figures
+               "final totals": "#e0b27a", "schema job (reads footers)": "#7D8998", "no input rows": "#b0b7bd"}   # same colours as the L6 figures
 
 
 # ---------------------------------------------------------------- setup
 def setup(spark, save_to=None):
-    """Connect to the driver's status store, count executor cores, remember where to save. Prints what it found."""
+    """Connect to the driver's status store, count the slots (executor cores), remember where to save. Prints what it
+    found."""
     sc = spark.sparkContext
     _S.update(spark=spark, store=sc._jsc.sc().statusStore(), jvm=sc._jvm, gateway=sc._gateway,
               save_to=save_to.rstrip("/") + "/" if save_to else None,
@@ -53,18 +54,19 @@ def setup(spark, save_to=None):
     spark.conf.set("spark.sql.maxMetadataStringLength", "2000")    # the plan prints its filters in full
     try:
         import pandas as pd
-        pd.set_option("display.width", 250); pd.set_option("display.max_columns", 40)
+        pd.set_option("display.width", 100); pd.set_option("display.max_columns", 40)   # wider frames split, not wrap
     except ImportError:
         pass
-    now = f"{len(_S['executors'])} executors, {_S['cores']} cores" if _S["cores"] else \
-        "executors join with the first query (cores are counted at every measurement)"
-    print(f"Spark {spark.version} | {now} | "
-          f"shuffle partitions {spark.conf.get('spark.sql.shuffle.partitions')} | "
+    per = sorted(set(_S["executors"].values()))
+    now = (f"{len(_S['executors'])} executors ({'/'.join(map(str, per))} executor cores each), {_S['cores']} slots"
+           if _S["cores"] else "slots: none yet; executors join with the first query (slots are counted at every run)")
+    print(f"Spark {spark.version} | shuffle partitions {spark.conf.get('spark.sql.shuffle.partitions')}\n{now}\n"
+          "a slot is one executor core (spark.executor.cores): it runs one task at a time\n"
           f"saving to {_S['save_to'] or 'memory only (report() will see this session only)'}")
 
 
 def _count_cores():
-    """Executors alive right now (not the driver) and their cores."""
+    """Executors alive right now (not the driver) and their slots (spark.executor.cores each)."""
     ex = _seq(_S["store"].executorList(True))
     _S["executors"] = {e.id(): e.totalCores() for e in ex if e.id() != "driver"}
     _S["cores"] = sum(_S["executors"].values())
@@ -73,6 +75,95 @@ def _count_cores():
 def _seq(x):
     """A Scala Seq from py4j as a Python list."""
     return [x.apply(i) for i in range(x.size())]
+
+
+# ---------------------------------------------------------------- printing: about 100 characters wide
+WIDTH = 100
+RULE = "─" * WIDTH    # printed after each sm call's output, so several calls in one cell read apart
+_TABLE = []
+
+
+def _table(df, groups, notes=(), hide=()):
+    """df, printed to fit WIDTH characters: column groups packed into blocks (each block repeats the row labels),
+    then the notes. It stays one DataFrame: index it, filter it, plot it as usual. Columns in `hide` are left out
+    of the printout (the notes say them)."""
+    import pandas as pd
+    if not _TABLE:
+        class Table(pd.DataFrame):
+            _metadata = ["groups", "notes", "hide"]
+
+            @property
+            def _constructor(self):
+                return Table
+
+            def _blocks(self):
+                plain = pd.DataFrame(self)
+                cols, groups, hide = list(plain.columns), getattr(self, "groups", None) or [], getattr(self, "hide", ())
+                full = all(c in cols for g in groups for c in g)
+                if not full:                                     # a selection of columns: pandas prints it, no notes
+                    return plain, [], []
+                kept = [[c for c in g if c in cols] for g in groups]
+                kept = [g for g in kept if g]
+                rest = [c for c in cols if c not in hide and not any(c in g for g in kept)]
+                kept += [rest] if rest else []
+                blocks, cur = [], []
+                for g in kept:                                   # pack groups while the block fits WIDTH
+                    trial = cur + [c for c in g if c not in cur]
+                    if cur and max(map(len, plain[trial].to_string().splitlines())) > WIDTH:
+                        blocks.append(cur); cur = list(g)
+                    else:
+                        cur = trial
+                blocks += [cur] if cur else []
+                return plain, blocks, (getattr(self, "notes", None) or []) if full else []
+
+            def __repr__(self):
+                plain, blocks, notes = self._blocks()
+                if plain.empty or not blocks:
+                    return repr(plain)
+                return ("\n\n".join(plain[b].to_string() for b in blocks) + ("\n" + "\n".join(notes) if notes else "")
+                        + "\n" + RULE)
+
+            __str__ = __repr__
+
+            def _repr_html_(self):
+                import html
+                plain, blocks, notes = self._blocks()
+                if plain.empty or not blocks:
+                    return plain._repr_html_()
+                return "".join(plain[b]._repr_html_() for b in blocks) + \
+                    (f"<pre>{html.escape(chr(10).join(notes))}</pre>" if notes else "")
+        _TABLE.append(Table)
+    t = _TABLE[0](df)
+    t.groups, t.notes, t.hide = [list(g) for g in groups], list(notes), tuple(hide)
+    return t
+
+
+def _wrap(head, items, width=WIDTH, tail=""):
+    """head, then the items joined by ", ", wrapped under the first item; tail goes after the last item."""
+    pad, lines, cur = " " * len(head), [], head
+    room = max(width - len(head) - 1, 20)                           # 1 for the comma
+    items = [x if len(x) <= room else x[:room - 2] + "…" for x in items] or ["(none)"]
+    for i, x in enumerate(items):
+        piece = x + ("," if i < len(items) - 1 else tail)
+        if cur != head and len(cur) + 1 + len(piece) > width:
+            lines.append(cur); cur = pad + piece
+        else:
+            cur += ("" if cur == head else " ") + piece
+    if len(cur) > width and tail and cur.endswith(tail):           # the tail goes on its own line
+        lines.append(cur[:-len(tail)]); cur = pad + tail.strip()
+    return "\n".join(lines + [cur])
+
+
+def _split_top(text):
+    """'IsNotNull(a), GreaterThan(a,5)' -> ['IsNotNull(a)', 'GreaterThan(a,5)']: commas outside brackets only."""
+    out, depth, cur = [], 0, ""
+    for ch in text:
+        depth += ch in "([" ; depth -= ch in ")]"
+        if ch == "," and depth == 0:
+            out.append(cur.strip()); cur = ""
+        else:
+            cur += ch
+    return out + ([cur.strip()] if cur.strip() else [])
 
 
 # ---------------------------------------------------------------- measuring
@@ -208,6 +299,7 @@ def _record(query, cname, settings, wall, stages, plan, note="", rep=None):
     _S["runs"].append(run)
     _save(run)
     print(f"{query} | {cname} | run {rep}: {wall:.2f} s, {len(stages)} stages")
+    print(RULE)
     return run
 
 
@@ -250,7 +342,16 @@ def _plan_facts(eid):
     values = st.executionMetrics(eid)
     metrics = {"number of files read": 0, "number of partitions read": 0}
     found, scans = set(), 0
+    aqe = []                                   # one entry per AQEShuffleRead node: how it merged or split Exchange output partitions
     for node in _seq(st.planGraph(eid).allNodes()):
+        if node.name().startswith("AQEShuffleRead"):
+            one = {"node": node.desc()}
+            for m in _seq(node.metrics()):
+                if m.name().startswith("number of"):
+                    v = values.get(m.accumulatorId())
+                    if v.isDefined():
+                        one[m.name()] = int(str(v.get()).replace(",", "").split()[0])
+            aqe.append(one)
         if not node.name().startswith("Scan"):
             continue
         scans += 1
@@ -264,7 +365,7 @@ def _plan_facts(eid):
                 footer_answer=bool(grab("PushedAggregation")) or "EnablePushdownAggregate: true" in final,
                 files_read=metrics["number of files read"] if "number of files read" in found else None,
                 folders_read=metrics["number of partitions read"] if "number of partitions read" in found else None,
-                scans=scans, plan=final[:20000])
+                scans=scans, skew_join=("(skew=true)" in final or "AQEShuffleRead skewed" in final or "AQEShuffleRead coalesced and skewed" in final), aqe=aqe, plan=final[:20000])
 
 
 def _conf_or_none(spark, key):
@@ -353,10 +454,13 @@ def _load_all():
 
 def open_saved(save_to):
     """Load every run saved under save_to, without Spark (e.g. on your laptop, or after the session ended).
-    Then stage_table, allocation, timeline and report work on them; timeline(..., cores=16) picks a core count."""
+    Then stage_table, allocation, timeline and report work on them; timeline(..., cores=16) picks the runs with
+    16 slots (the argument keeps its old name, so saved runs and old notebooks still work)."""
     _S["save_to"] = save_to.rstrip("/") + "/"
     _S["runs"] = _load_all()
-    print(f"{len(_S['runs'])} runs: " + ", ".join(sorted({f"{r['query']}/{r['config']}@{r['cores']}c" for r in _S['runs']})[:12]) + " ...")
+    kinds = sorted({f"{r['query']} | {r['config']} | {r['cores']} slots" for r in _S["runs"]})
+    print(f"{len(_S['runs'])} runs of {len(kinds)} kinds:")
+    print("\n".join("  " + k for k in kinds[:12]) + ("\n  ..." if len(kinds) > 12 else ""))
 
 
 # ---------------------------------------------------------------- reading files: the six steps
@@ -369,17 +473,19 @@ def checklist(query, config=None, rep=None):
     tasks = scan["tasks"] if scan else []
     reading = sum(1 for t in tasks if t["rows_read"])
     rows = sum(t["rows_read"] for t in tasks)
-    short = lambda xs: "; ".join(x if len(x) <= 160 else x[:159] + "…" for x in xs) or "(none)"
-    folders = f"  ->  {p['folders_read']} folders kept" if p.get("folders_read") is not None else ""
-    print(f"{query} | {run['config']} | {run['wall_s']:.2f} s"
-          + (f"  (this query reads {p['scans']} inputs: files and folders below add them up)" if p.get("scans", 1) > 1 else ""))
-    print(f"1-2. folders   PartitionFilters: {short(p.get('partition_filters', []))}{folders}")
-    print(f"3.   ranges    {p.get('files_read', '?')} files  ->  {len(tasks)} scan tasks")
-    print(f"4-5. footers   PushedFilters: {short(p.get('pushed_filters', []))}")
+    each = lambda xs: [y for x in xs for y in _split_top(x)]        # one condition per item, wrapped at WIDTH
+    n = p.get("folders_read"); folders = f"  ->  {n} folder{'s' if n != 1 else ''} kept" if n is not None else ""
+    print(f"{query} | {run['config']} | {run['wall_s']:.2f} s")
+    if p.get("scans", 1) > 1:
+        print(f"(this query reads {p['scans']} inputs: the files and folders below add them up)")
+    print(_wrap("1-2. folders   PartitionFilters: ", each(p.get("partition_filters", [])), tail=folders))
+    nf = p.get("files_read"); print(f"3.   ranges    {nf if nf is not None else '?'} file{'' if nf == 1 else 's'}  ->  {len(tasks)} scan task{'' if len(tasks) == 1 else 's'}")
+    print(_wrap("4-5. footers   PushedFilters: ", each(p.get("pushed_filters", []))))
     print(f"               {reading} of {len(tasks)} scan tasks still hold a row group (reading tasks)")
     marker = "EnablePushdownAggregate: true" if "EnablePushdownAggregate: true" in p.get("plan", "") else "PushedAggregation"
-    print(f"6.   read      {rows:,} rows" + (f"  (answered from the footers, one row per row group: the plan's scan says {marker})"
-                                              if p.get("footer_answer") else ""))
+    print(f"6.   read      {rows:,} rows" + (f"  (answered from the footers, one row per row group;\n"
+                                              f"               the plan's scan says {marker})" if p.get("footer_answer") else ""))
+    print(RULE)
 
 
 def footer(path, column="all", between=None, region="ca-central-1"):
@@ -469,6 +575,7 @@ def tree(path, row_groups=False, show_first=2, show_last=1, region="ca-central-1
                 lines.append(f"{pad}{'    ' if flast else '│   '}└── {n} row group{'s' if n != 1 else ''}, "
                              f"about {md.num_rows // max(n, 1):,} rows each")
     print("\n".join(lines))
+    print(RULE)
 
 
 def _fs(path, region):
@@ -507,27 +614,77 @@ def _pick(query, config=None, rep=None, cores=None):
     if not rs:
         raise ValueError(f"No run of {query!r} with config {config!r} in this session. Measured: "
                          f"{sorted({(r['query'], r['config']) for r in _S['runs']})}")
-    return rs[-1] if rep is None else next(r for r in rs if r["rep"] == rep)
+    if rep is None:
+        return rs[-1]
+    r = next((r for r in rs if r["rep"] == rep), None)
+    if r is None:
+        raise ValueError(f"No run {rep} of {query!r} with config {config!r}. Runs: {sorted(x['rep'] for x in rs)}")
+    return r
 
 
 def stage_table(query, config=None, rep=None, cores=None):
-    """L6's table for one run: per stage, tasks, tasks with rows, rows, what went into an Exchange, task times."""
-    import pandas as pd
+    """L6's table for one run: per stage, its tasks, the rows they took in and sent into an Exchange, and how even the
+    tasks were (largest and median task, longest and median task time). Printed in two blocks, then notes on the
+    columns; it is one DataFrame (spill to disk MB is a column too, printed in the notes)."""
     run = _pick(query, config, rep, cores)
     scan_rows = max((sum(t["rows_read"] for t in s["tasks"]) for s in run["stages"]), default=0)
-    rows = []
+    rows, both = [], []
     for s in run["stages"]:
         ts = s["tasks"]; d = [t["dur_s"] for t in ts]
-        rows.append({"stage": s["stage"], "does": _role(s, scan_rows, run['stages'][-1]['stage']), "tasks": len(ts),
-                     "tasks with rows": sum(1 for t in ts if t["rows_read"] or t["rows_from_exchange"]),
-                     "rows read": sum(t["rows_read"] for t in ts),
-                     "rows from Exchange": sum(t["rows_from_exchange"] for t in ts),
+        handled = [t["rows_read"] + t["rows_from_exchange"] for t in ts]   # rows each task read or received
+        busy = [h for h in handled if h]
+        read, got = sum(t["rows_read"] for t in ts), sum(t["rows_from_exchange"] for t in ts)
+        if read and got:
+            both.append(f"stage {s['stage']}: {read:,} read from files + {got:,} received from an Exchange")
+        rows.append({"stage": s["stage"], "does": _short_role(_role(s, scan_rows, run["stages"][-1]["stage"])),
+                     "tasks": len(ts), "tasks with rows": len(busy), "rows in": read + got,
                      "rows to Exchange": sum(t["rows_into_exchange"] for t in ts),
                      "MB to Exchange": round(sum(t["bytes_into_exchange"] for t in ts) / 1e6, 2),
-                     "spill to disk MB": round(sum(t["spill_disk"] for t in ts) / 1e6, 1),
-                     "longest task s": round(max(d), 2), "median task s": round(statistics.median(d), 2)})
-    print(f"{query} | {run['config']} | run {run['rep']} | {run['cores']} cores | {run['wall_s']:.2f} s")
-    return pd.DataFrame(rows).set_index("stage")
+                     "largest task rows": max(handled, default=0),
+                     "median task rows": int(statistics.median(busy)) if busy else 0,
+                     "longest task s": round(max(d, default=0), 2),
+                     "median task s": round(statistics.median(d), 2) if d else 0,
+                     "spill to disk MB": round(sum(t["spill_disk"] for t in ts) / 1e6, 1)})
+    import pandas as pd
+    df = pd.DataFrame(rows).set_index("stage")
+    spill = [f"stage {k}: {v}" for k, v in df["spill to disk MB"].items() if v]
+    notes = ["rows in: rows read from files, or received from an Exchange (in a stage after one)"] + both + [
+             "tasks with rows: tasks whose rows in is above 0",
+             "rows to Exchange, MB to Exchange: rows the stage's tasks sent into an Exchange, and their size",
+             "largest task rows: the busiest task's rows in; median task rows: over the tasks with rows",
+             "longest task s, median task s: task times in seconds",
+             "spill to disk MB: " + ("; ".join(spill) if spill else "0 in every stage")]
+    if (df["does"] == "schema job").any():
+        notes.append("schema job: Spark reads one file's footer for the schema (no rows)")
+    print(f"{query} | {run['config']} | run {run['rep']} | {run['cores']} slots | {run['wall_s']:.2f} s")
+    return _table(df, [["does", "tasks", "tasks with rows", "rows in", "rows to Exchange", "MB to Exchange"],
+                       ["does", "largest task rows", "median task rows", "longest task s", "median task s"]],
+                  notes, hide=["spill to disk MB"])
+
+
+def _short_role(role):
+    """The stage's role for the tables: the timeline's words, with the schema job named in two words."""
+    return "schema job" if role == "schema job (reads footers)" else role
+
+
+def aqe(query, config=None, rep=None, cores=None):
+    """What adaptive execution changed in one run's final plan: merged (coalesced) and split (skewed) partitions."""
+    run = _pick(query, config, rep, cores)
+    p = run["plan"] if isinstance(run["plan"], dict) else {}
+    text = p.get("plan", "")
+    lines = [l.strip() for l in text.splitlines() if "AQEShuffleRead" in l or "isSkewJoin" in l or "SortMergeJoin" in l
+             or "BroadcastHashJoin" in l or "ShuffledHashJoin" in l]
+    print(f"{query} | {run['config']} | run {run['rep']}")
+    for l in list(dict.fromkeys(lines))[:12]:
+        print("  ", l if len(l) <= WIDTH - 4 else l[:WIDTH - 5] + "…")
+    nodes = p.get("aqe") or []
+    if isinstance(nodes, list) and nodes:
+        print("   Exchange output partitions after adaptive execution:")
+    for one in (nodes if isinstance(nodes, list) else []):          # runs saved by the old helper hold a summed dict: skip
+        facts = [f"{k.replace('number of ', '')} {v}" for k, v in sorted(one.items()) if k != "node"]
+        print(_wrap(f"   {one['node'][:40]}: ", facts))
+    print("   skew join:", "yes, a hot partition was split" if p.get("skew_join") else "no split")
+    print(RULE)
 
 
 def allocation(query, config=None, rep=None, cores=None):
@@ -537,18 +694,21 @@ def allocation(query, config=None, rep=None, cores=None):
     scan_rows = max((sum(t["rows_read"] for t in s["tasks"]) for s in run["stages"]), default=0)
     rows = []
     for s in run["stages"]:
-        role = _role(s, scan_rows, run['stages'][-1]['stage'])
+        role = _short_role(_role(s, scan_rows, run['stages'][-1]['stage']))
         for ex in sorted({t["executor"] for t in s["tasks"]}):
             ts = [t for t in s["tasks"] if t["executor"] == ex]
             rows.append({"stage": s["stage"], "does": role, "executor": ex, "tasks": len(ts),
                          "rows": sum(t["rows_read"] + t["rows_from_exchange"] for t in ts),
                          "busy s": round(sum(t["dur_s"] for t in ts), 2)})
-    return pd.DataFrame(rows).set_index(["stage", "executor"])
+    print(f"{query} | {run['config']} | run {run['rep']} | {len(run['executors'])} executors, {run['cores']} slots")
+    return _table(pd.DataFrame(rows).set_index(["stage", "executor"]), [["does", "tasks", "rows", "busy s"]],
+                  ["rows: rows the executor's tasks read from files or received from an Exchange",
+                   "busy s: its task times added up (its slots run tasks side by side: this can pass the stage time)"])
 
 
 def timeline(query, config=None, rep=None, xmax=None, show_footers=False, title=None, cores=None,
              other_label="reads another input", final_label="final totals"):
-    """Which core ran which task, when. One row per core, grouped by executor; colour = the stage, hatched = the task
+    """Which slot ran which task, when. One row per slot (one executor core), grouped by executor; colour = the stage, hatched = the task
     read 0 rows (same words and colours as the L6 figures). Name the second input and the last stage for your query,
     e.g. other_label="reads the name table", final_label="totals per name". In a Glue notebook: %matplot plt."""
     import matplotlib
@@ -584,7 +744,7 @@ def timeline(query, config=None, rep=None, xmax=None, show_footers=False, title=
     for e in exs[1:]:
         ax.axhline(base[e] - 0.5, color="#7D8998", lw=0.8)
     ax.set_yticks([base[e] + max(len(lanes[e]), run["executors"].get(e, 0)) / 2 - 0.5 for e in exs])
-    ax.set_yticklabels([f"executor {e}\n({run['executors'].get(e, '?')} cores)" for e in exs])
+    ax.set_yticklabels([f"executor {e}\n({run['executors'].get(e, '?')} slots)" for e in exs])
     ax.set_ylim(y - 0.5, -0.5); ax.set_xlabel("seconds since first task")
     if xmax: ax.set_xlim(0, xmax)
     for side in ("top", "right"): ax.spines[side].set_visible(False)
@@ -602,7 +762,7 @@ def timeline(query, config=None, rep=None, xmax=None, show_footers=False, title=
         if any(p[5] for p in mine) and r != "schema job (reads footers)":
             handles.append(Patch(facecolor="none", edgecolor=ROLE_COLOUR[r], hatch="///", label=label(r, True)))
     ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=2, frameon=False)
-    ax.set_title(title or f"{query} | {run['config']} | {run['cores']} cores | rep {run['rep']} | {run['wall_s']:.2f} s",
+    ax.set_title(title or f"{query} | {run['config']} | {run['cores']} slots | rep {run['rep']} | {run['wall_s']:.2f} s",
                  loc="left", fontsize=11)
     fig.tight_layout()
     return fig
@@ -610,9 +770,10 @@ def timeline(query, config=None, rep=None, xmax=None, show_footers=False, title=
 
 # ---------------------------------------------------------------- comparing
 def report(everything=True):
-    """One row per query and config, one column per core count: median query time over reps, and from the busiest
-    stage after an Exchange, the tasks with rows and the largest task's rows. everything=True reads every saved
-    session in save_to; False uses this session only."""
+    """One row per query and config, one column per slot count: median query time over reps, scan tasks with rows,
+    and from the busiest stage after an Exchange, the tasks with rows and the largest task's rows. Printed as one
+    block per measure when the slot counts don't fit side by side. everything=True reads every saved session in
+    save_to; False uses this session only."""
     import pandas as pd
     rows = []
     for r in _runs(everything=everything):
@@ -632,9 +793,19 @@ def report(everything=True):
     t = g.agg(reps=("wall_s", "size"), median_s=("wall_s", "median"), scan_tasks=("scan_tasks", "first"),
               scan_reading=("scan_reading", "first"), after_tasks=("after_tasks", "first"),
               after_with_rows=("after_with_rows", "first"), largest_task_rows=("largest_task_rows", "first"))
+    t["median s"] = t.median_s.round(2)
     t["scan"] = t.scan_reading.astype(str) + " of " + t.scan_tasks.astype(str)
     t["after Exchange"] = t.after_with_rows.astype(str) + " of " + t.after_tasks.astype(str)
-    t["largest task (M rows)"] = (t.largest_task_rows / 1e6).round(2)
-    wide = t[["median_s", "scan", "after Exchange", "largest task (M rows)"]].unstack("cores")
-    wide.columns = [f"{m} @ {c} cores" for m, c in wide.columns]
-    return wide
+    t["largest task M rows"] = (t.largest_task_rows / 1e6).round(2)
+    measures = ["median s", "runs", "scan", "after Exchange", "largest task M rows"]
+    t["runs"] = t.reps
+    wide = t[measures].unstack("cores")
+    wide.columns = pd.MultiIndex.from_tuples([(m, f"{c} slots") for m, c in wide.columns])
+    for c in wide.columns:
+        if c[0] == "runs":
+            wide[c] = wide[c].astype("Int64")                    # a count, also where a slot count has no run
+    return _table(wide, [[c for c in wide.columns if c[0] == m] for m in measures],
+                  ["median s: median query time over the runs; runs: how many runs",
+                   "scan: scan tasks that read rows, of all scan tasks",
+                   "after Exchange: in the stage after an Exchange that got the most rows, tasks with rows, of all",
+                   "largest task M rows: that stage's largest task, millions of rows received"])
